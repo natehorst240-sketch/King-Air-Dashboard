@@ -3,7 +3,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import process from 'node:process';
-import { chromium, type Download, type Locator, type Page } from 'playwright';
+import { chromium, type BrowserContext, type Download, type Locator, type Page } from 'playwright';
 import XLSX from 'xlsx';
 
 const LOGIN_URL: string =
@@ -51,6 +51,42 @@ function log(message: string): void {
 
 async function ensureDir(dirPath: string): Promise<void> {
   await fs.mkdir(dirPath, { recursive: true });
+}
+
+// FlightDocs uses Pendo for in-app guides, which inject a full-page backdrop
+// (#pendo-base / ._pendo-backdrop) that intercepts pointer events and blocks
+// clicks on the toolbar. Block the network requests so guides never load.
+async function blockPendo(context: BrowserContext): Promise<void> {
+  await context.route(
+    /(pendo\.io|pendo-static|pendo-io-static|data\.pendo)/i,
+    (route) => route.abort(),
+  );
+}
+
+// Defensive fallback: if a Pendo overlay slips through, remove it from the DOM.
+// Returns the number of elements removed so callers can decide whether to retry.
+async function dismissPendoOverlays(page: Page): Promise<number> {
+  try {
+    const removed = await page.evaluate(() => {
+      const selectors = [
+        '#pendo-base',
+        '[id^="pendo-backdrop"]',
+        '[class*="_pendo-backdrop"]',
+        '[class*="_pendo-step-container"]',
+        '[id^="pendo-guide"]',
+        '[class*="pendo-resource-center"]',
+        '[class*="_pendo-badge"]',
+      ];
+      let count = 0;
+      for (const selector of selectors) {
+        document.querySelectorAll(selector).forEach((el) => { el.remove(); count += 1; });
+      }
+      return count;
+    });
+    return removed;
+  } catch {
+    return 0;
+  }
 }
 
 async function getLocatorIfPresent(page: Page, selector: string): Promise<Locator | null> {
@@ -230,6 +266,11 @@ async function exportDueList(page: Page): Promise<Download> {
     log('Network did not become fully idle; proceeding anyway');
   }
 
+  const dismissedOnLoad = await dismissPendoOverlays(page);
+  if (dismissedOnLoad > 0) {
+    log(`Removed ${dismissedOnLoad} Pendo overlay element(s) after page settled`);
+  }
+
   const exportSelectors: string[] = [
     'button:has-text("Export")',
     'a:has-text("Export")',
@@ -297,7 +338,15 @@ async function exportDueList(page: Page): Promise<Download> {
           },
         );
 
-        await locator.click({ timeout: 10_000 });
+        await dismissPendoOverlays(page);
+        try {
+          await locator.click({ timeout: 10_000 });
+        } catch (clickErr) {
+          const removed = await dismissPendoOverlays(page);
+          if (removed === 0) throw clickErr;
+          log(`Export click intercepted; removed ${removed} Pendo element(s) and retrying`);
+          await locator.click({ timeout: 10_000 });
+        }
 
         // Actively poll for a submenu item rather than relying on a fixed wait.
         // Stop polling as soon as a submenu is clicked or the download fires
@@ -309,6 +358,7 @@ async function exportDueList(page: Page): Promise<Download> {
           !downloadResolved &&
           Date.now() - submenuStart < submenuPollTimeoutMs
         ) {
+          await dismissPendoOverlays(page);
           for (const subSelector of exportSubMenuSelectors) {
             const subLocator = await getLocatorIfPresent(page, subSelector);
             if (subLocator && (await isClickable(subLocator))) {
@@ -403,6 +453,7 @@ async function runOnce(): Promise<void> {
 
   const browser = await chromium.launch({ headless: HEADLESS });
   const context = await browser.newContext({ acceptDownloads: true });
+  await blockPendo(context);
   const page = await context.newPage();
 
   try {
